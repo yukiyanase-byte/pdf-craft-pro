@@ -1,0 +1,151 @@
+import * as PDFLib from 'pdf-lib';
+import * as pdfjs from 'pdfjs-dist';
+import { createWorker } from 'tesseract.js';
+
+// Set up pdfjs worker
+pdfjs.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.min.mjs`;
+
+export interface PDFPageInfo {
+  id: string;
+  fileId: string;
+  pageIndex: number;
+  rotation: number;
+  thumbnailUrl: string;
+  fileName: string;
+  annotations?: Annotation[];
+}
+
+export interface Annotation {
+  id: string;
+  type: 'text' | 'rect' | 'highlight';
+  x: number;
+  y: number;
+  width?: number;
+  height?: number;
+  text?: string;
+  color?: string;
+}
+
+export interface PDFFile {
+  id: string;
+  name: string;
+  data: Uint8Array;
+}
+
+export class PDFService {
+  static async getPageThumbnails(file: File | Blob, fileId: string): Promise<PDFPageInfo[]> {
+    const arrayBuffer = await file.arrayBuffer();
+    const data = new Uint8Array(arrayBuffer);
+    const loadingTask = pdfjs.getDocument({ data });
+    const pdf = await loadingTask.promise;
+    const pages: PDFPageInfo[] = [];
+
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const viewport = page.getViewport({ scale: 0.5 });
+      const canvas = document.createElement('canvas');
+      const context = canvas.getContext('2d');
+      canvas.height = viewport.height;
+      canvas.width = viewport.width;
+
+      if (context) {
+        await page.render({ 
+          canvasContext: context, 
+          viewport,
+          canvas
+        }).promise;
+        pages.push({
+          id: `${fileId}-${i}-${Math.random().toString(36).substr(2, 5)}`,
+          fileId,
+          pageIndex: i - 1,
+          rotation: 0,
+          thumbnailUrl: canvas.toDataURL(),
+          fileName: (file as File).name || 'document.pdf',
+        });
+      }
+    }
+
+    return pages;
+  }
+
+  static async generateModifiedPDF(
+    files: Map<string, PDFFile>,
+    pages: PDFPageInfo[],
+    globalWatermark?: string
+  ): Promise<Uint8Array> {
+    const mergedPdf = await PDFLib.PDFDocument.create();
+    const font = await mergedPdf.embedFont(PDFLib.StandardFonts.HelveticaBold);
+
+    for (const pageInfo of pages) {
+      const sourceFile = files.get(pageInfo.fileId);
+      if (!sourceFile) continue;
+
+      const sourcePdf = await PDFLib.PDFDocument.load(sourceFile.data);
+      const [copiedPage] = await mergedPdf.copyPages(sourcePdf, [pageInfo.pageIndex]);
+      
+      copiedPage.setRotation(PDFLib.degrees(pageInfo.rotation));
+      
+      // Apply annotations
+      if (pageInfo.annotations) {
+        for (const ann of pageInfo.annotations) {
+          const { width, height } = copiedPage.getSize();
+          // Convert relative coordinates (0-100) to PDF coordinates
+          const pdfX = (ann.x / 100) * width;
+          const pdfY = height - (ann.y / 100) * height; // PDF origin is bottom-left
+
+          if (ann.type === 'text' && ann.text) {
+            copiedPage.drawText(ann.text, {
+              x: pdfX,
+              y: pdfY,
+              size: 20,
+              font,
+              color: PDFLib.rgb(0, 0, 0),
+            });
+          } else if (ann.type === 'rect' || ann.type === 'highlight') {
+            const rectW = (ann.width || 10) / 100 * width;
+            const rectH = (ann.height || 5) / 100 * height;
+            copiedPage.drawRectangle({
+              x: pdfX,
+              y: pdfY - rectH,
+              width: rectW,
+              height: rectH,
+              color: ann.type === 'highlight' ? PDFLib.rgb(1, 1, 0) : PDFLib.rgb(0.8, 0.8, 0.8),
+              opacity: ann.type === 'highlight' ? 0.4 : 1,
+            });
+          }
+        }
+      }
+
+      // Apply global watermark
+      if (globalWatermark) {
+        const { width, height } = copiedPage.getSize();
+        copiedPage.drawText(globalWatermark, {
+          x: width / 4,
+          y: height / 2,
+          size: 50,
+          font,
+          color: PDFLib.rgb(0.7, 0.7, 0.7),
+          opacity: 0.3,
+          rotate: PDFLib.degrees(45),
+        });
+      }
+      
+      mergedPdf.addPage(copiedPage);
+    }
+
+    return await mergedPdf.save();
+  }
+
+  static async performOCR(imageUrl: string): Promise<string> {
+    const worker = await createWorker('jpn+eng');
+    const ret = await worker.recognize(imageUrl);
+    await worker.terminate();
+    return ret.data.text;
+  }
+
+  static async compressPDF(data: Uint8Array): Promise<Uint8Array> {
+    // Basic compression by re-saving with pdf-lib (removes unused objects)
+    const pdfDoc = await PDFLib.PDFDocument.load(data);
+    return await pdfDoc.save({ useObjectStreams: true });
+  }
+}
